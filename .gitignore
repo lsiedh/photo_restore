@@ -1,0 +1,14 @@
+.DS_Store
+.Rhistory
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+*.pyd
+outputs/
+TestPics/
+gfpgan/
+*.pth
+*.pt
+*.log

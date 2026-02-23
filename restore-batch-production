@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+PRESET_FILE="$SCRIPT_DIR/presets/production.args"
+RUN_PREFIX="${RUN_PREFIX:-batch_prod}"
+
+if [ ! -f "$PRESET_FILE" ]; then
+  echo "Missing preset file: $PRESET_FILE" >&2
+  exit 2
+fi
+
+if [ "$#" -lt 1 ]; then
+  cat >&2 <<'USAGE'
+Usage:
+  ./restore-batch-production <input_dir> [output_root] [-- <extra restore-batch args>]
+
+Examples:
+  ./restore-batch-production /abs/path/to/input
+  ./restore-batch-production /abs/path/to/input /abs/path/to/outputs
+  ./restore-batch-production /abs/path/to/input /abs/path/to/outputs -- --face-model-path /abs/path/GFPGANv1.4.pth
+USAGE
+  exit 2
+fi
+
+INPUT_DIR="$1"
+shift
+
+OUTPUT_ROOT="$SCRIPT_DIR/outputs"
+if [ "$#" -gt 0 ] && [ "$1" != "--" ]; then
+  OUTPUT_ROOT="$1"
+  shift
+fi
+
+if [ "$#" -gt 0 ] && [ "$1" = "--" ]; then
+  shift
+fi
+
+if [ ! -d "$INPUT_DIR" ]; then
+  echo "Input directory not found: $INPUT_DIR" >&2
+  exit 2
+fi
+
+RUN_ID="${RUN_PREFIX}_$(date +%Y%m%d_%H%M%S)"
+RUN_OUT="$OUTPUT_ROOT/$RUN_ID"
+mkdir -p "$RUN_OUT"
+
+declare -a PRESET_ARGS=()
+while IFS= read -r RAW || [ -n "$RAW" ]; do
+  LINE="${RAW%%#*}"
+  LINE="$(printf '%s' "$LINE" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  if [ -n "$LINE" ]; then
+    PRESET_ARGS+=("$LINE")
+  fi
+done < "$PRESET_FILE"
+
+echo "Preset: $PRESET_FILE"
+echo "Input:  $INPUT_DIR"
+echo "Output: $RUN_OUT"
+
+"$SCRIPT_DIR/restore-batch" \
+  "$INPUT_DIR" \
+  "$RUN_OUT" \
+  "${PRESET_ARGS[@]}" \
+  "$@" 2>&1 | tee "$RUN_OUT/run.log"
+
+echo "Completed production run:"
+echo "  $RUN_OUT"
