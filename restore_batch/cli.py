@@ -8,21 +8,18 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-
 from .classification import ClassificationConfig, ImageTypeClassificationStage
 from .denoise import DenoiseConfig, DenoiseStage
 from .discovery import discover_images
 from .face_enhance import FaceEnhancementConfig, FaceEnhancementStage
 from .flatfield import FlatFieldConfig, FlatFieldStage
+from .jpeg_out import JpegExportConfig, JpegExportError, export_jpg_with_cap
 from .metadata import JsonlMetadataWriter, SidecarMetadataWriter
 from .models import ImageContext
 from .normalize import NormalizationConfig, NormalizationStage
 from .pipeline import ProcessingPipeline
-from .png16 import write_rgb_u16_png
 from .redeye import RedEyeConfig, RedEyeStage
 from .sharpen import SharpenConfig, SharpenStage
-from .tiff16 import write_rgb_u16_tiff
 from .tonal import TonalNormalizationConfig, TonalNormalizationStage
 from .white_balance import WhiteBalanceConfig, WhiteBalanceStage
 
@@ -77,9 +74,45 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-format",
-        choices=("png", "tiff"),
-        default="png",
-        help="Output format for normalized images.",
+        choices=("jpg",),
+        default="jpg",
+        help="Output format for restored images.",
+    )
+    parser.add_argument(
+        "--jpg-max-mb",
+        type=float,
+        default=3.0,
+        help="Maximum final JPG size in MiB per image.",
+    )
+    parser.add_argument(
+        "--jpg-quality-max",
+        type=int,
+        default=92,
+        help="Maximum JPG quality to try during size-cap search.",
+    )
+    parser.add_argument(
+        "--jpg-quality-min",
+        type=int,
+        default=62,
+        help="Minimum JPG quality to try before downscaling.",
+    )
+    parser.add_argument(
+        "--jpg-quality-step",
+        type=int,
+        default=4,
+        help="JPG quality decrement step during size-cap search.",
+    )
+    parser.add_argument(
+        "--jpg-downscale-step",
+        type=float,
+        default=0.90,
+        help="Per-iteration downscale factor when JPG is still over size cap.",
+    )
+    parser.add_argument(
+        "--jpg-min-side",
+        type=int,
+        default=320,
+        help="Minimum allowed image side while downscaling for JPG size cap.",
     )
     parser.add_argument(
         "--classification-threshold",
@@ -352,7 +385,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--redeye-red-ratio",
         type=float,
-        default=1.45,
+        default=1.65,
         help="Red dominance ratio threshold for red-eye masking.",
     )
     parser.add_argument(
@@ -360,6 +393,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=0.20,
         help="Minimum red channel level to consider red-eye candidates.",
+    )
+    parser.add_argument(
+        "--redeye-min-red-excess",
+        type=float,
+        default=0.12,
+        help="Minimum absolute red-over-nonred margin to qualify red-eye pixels.",
     )
     parser.add_argument(
         "--redeye-min-eye-px",
@@ -376,7 +415,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--redeye-max-mask-fraction",
         type=float,
-        default=0.28,
+        default=0.12,
         help="Maximum eye-region mask fraction to prevent overcorrection.",
     )
     parser.add_argument(
@@ -547,7 +586,7 @@ def alpha_background_rgb(name: str) -> tuple[int, int, int]:
 
 
 def output_suffix(output_format: str) -> str:
-    return ".png" if output_format == "png" else ".tiff"
+    return ".jpg"
 
 
 def sidecar_output_path(output_path: Path) -> Path:
@@ -589,35 +628,6 @@ def build_output_plan(
         collision_resolved[path] = resolved
 
     return outputs, collision_resolved
-
-
-def float_to_u16(image_f32: np.ndarray, *, output_format: str) -> tuple[np.ndarray, dict[str, Any]]:
-    clipped_low = int(np.count_nonzero(image_f32 < 0.0))
-    clipped_high = int(np.count_nonzero(image_f32 > 1.0))
-    clipped_total = clipped_low + clipped_high
-
-    clipped = np.clip(image_f32, 0.0, 1.0)
-    image_u16 = np.rint(clipped * 65535.0).astype(np.uint16)
-    metadata = {
-        "output_bit_depth": 16,
-        "output_channels": 3,
-        "output_color_space": "sRGB",
-        "output_format": output_format.upper(),
-        "conversion_clipped_values": clipped_total,
-        "conversion_clipped_low": clipped_low,
-        "conversion_clipped_high": clipped_high,
-    }
-    return image_u16, metadata
-
-
-def write_output(path: Path, image_u16: np.ndarray, *, output_format: str) -> None:
-    if output_format == "png":
-        write_rgb_u16_png(path, image_u16)
-        return
-    if output_format == "tiff":
-        write_rgb_u16_tiff(path, image_u16)
-        return
-    raise ValueError(f"Unsupported output format: {output_format}")
 
 
 def print_debug_stats(*, input_path: Path, metadata: dict[str, Any]) -> None:
@@ -848,6 +858,7 @@ def process_batch(args: argparse.Namespace) -> int:
             strength=args.redeye_strength,
             red_ratio=args.redeye_red_ratio,
             min_red=args.redeye_min_red,
+            min_red_excess=args.redeye_min_red_excess,
             min_eye_px=args.redeye_min_eye_px,
             min_mask_px=args.redeye_min_mask_px,
             max_mask_fraction=args.redeye_max_mask_fraction,
@@ -922,6 +933,14 @@ def process_batch(args: argparse.Namespace) -> int:
     redeye_eyes_detected_total = 0
     redeye_eyes_processed_total = 0
     redeye_eyes_skipped_total = 0
+    jpg_export_config = JpegExportConfig(
+        max_mb=args.jpg_max_mb,
+        quality_max=args.jpg_quality_max,
+        quality_min=args.jpg_quality_min,
+        quality_step=args.jpg_quality_step,
+        downscale_step=args.jpg_downscale_step,
+        min_side=args.jpg_min_side,
+    )
 
     for input_path in images:
         started = time.perf_counter()
@@ -934,6 +953,7 @@ def process_batch(args: argparse.Namespace) -> int:
             "pipeline_stages": stage_names,
             "output_name_collision_resolved": collision_flags[input_path],
         }
+        context: ImageContext | None = None
 
         try:
             if output_path.exists() and not args.overwrite:
@@ -948,8 +968,16 @@ def process_batch(args: argparse.Namespace) -> int:
             if context.image_f32 is None:
                 raise RuntimeError("Normalization stage did not produce image data.")
 
-            image_u16, conversion_meta = float_to_u16(context.image_f32, output_format=args.output_format)
-            write_output(output_path, image_u16, output_format=args.output_format)
+            conversion_meta = export_jpg_with_cap(
+                image_srgb_f32=context.image_f32,
+                output_path=output_path,
+                config=jpg_export_config,
+            )
+            jpg_dims = conversion_meta.get("jpg_export_dims")
+            if isinstance(jpg_dims, list) and len(jpg_dims) == 2:
+                output_size = [int(jpg_dims[0]), int(jpg_dims[1])]
+            else:
+                output_size = [int(context.image_f32.shape[1]), int(context.image_f32.shape[0])]
 
             elapsed_ms = round((time.perf_counter() - started) * 1000.0, 3)
             record.update(context.metadata)
@@ -958,7 +986,7 @@ def process_batch(args: argparse.Namespace) -> int:
                 {
                     "status": "ok",
                     "elapsed_ms": elapsed_ms,
-                    "output_size": [int(image_u16.shape[1]), int(image_u16.shape[0])],
+                    "output_size": output_size,
                 }
             )
             metadata_writer.write(record)
@@ -993,6 +1021,15 @@ def process_batch(args: argparse.Namespace) -> int:
                 face_enhance_no_faces_count += 1
             success_count += 1
             LOGGER.info("Processed %s -> %s", input_path.name, output_path)
+        except JpegExportError as exc:
+            error_count += 1
+            elapsed_ms = round((time.perf_counter() - started) * 1000.0, 3)
+            if context is not None:
+                record.update(context.metadata)
+            record.update(exc.metadata)
+            record.update({"status": "error", "error": str(exc), "elapsed_ms": elapsed_ms})
+            metadata_writer.write(record)
+            LOGGER.error("Failed JPG export for image: %s (%s)", input_path, exc)
         except Exception as exc:  # noqa: BLE001 - batch should continue after failures.
             error_count += 1
             elapsed_ms = round((time.perf_counter() - started) * 1000.0, 3)

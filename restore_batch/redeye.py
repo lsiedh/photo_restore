@@ -16,11 +16,12 @@ LOGGER = logging.getLogger("restore_batch")
 class RedEyeConfig:
     mode: str = "off"
     strength: float = 0.70
-    red_ratio: float = 1.45
+    red_ratio: float = 1.65
     min_red: float = 0.20
+    min_red_excess: float = 0.12
     min_eye_px: int = 12
     min_mask_px: int = 8
-    max_mask_fraction: float = 0.28
+    max_mask_fraction: float = 0.12
     feather_sigma: float = 1.20
     darken_factor: float = 0.55
 
@@ -202,6 +203,7 @@ def apply_redeye_reduction(
         "redeye_strength": float(np.clip(config.strength, 0.0, 1.0)),
         "redeye_red_ratio": float(max(1.0, config.red_ratio)),
         "redeye_min_red": float(np.clip(config.min_red, 0.0, 1.0)),
+        "redeye_min_red_excess": float(np.clip(config.min_red_excess, 0.0, 1.0)),
         "redeye_min_eye_px": int(max(1, config.min_eye_px)),
         "redeye_min_mask_px": int(max(1, config.min_mask_px)),
         "redeye_max_mask_fraction": float(np.clip(config.max_mask_fraction, 0.01, 1.0)),
@@ -243,6 +245,7 @@ def apply_redeye_reduction(
     safe_strength = float(np.clip(config.strength, 0.0, 1.0))
     safe_red_ratio = float(max(1.0, config.red_ratio))
     safe_min_red = float(np.clip(config.min_red, 0.0, 1.0))
+    safe_min_red_excess = float(np.clip(config.min_red_excess, 0.0, 1.0))
     safe_min_mask_px = int(max(1, config.min_mask_px))
     safe_max_mask_fraction = float(np.clip(config.max_mask_fraction, 0.01, 1.0))
     safe_feather_sigma = float(max(0.0, config.feather_sigma))
@@ -266,6 +269,7 @@ def apply_redeye_reduction(
             patch_rgb=patch,
             red_ratio=safe_red_ratio,
             min_red=safe_min_red,
+            min_red_excess=safe_min_red_excess,
         )
         raw_pixels = int(np.count_nonzero(raw_mask))
         raw_fraction = float(raw_pixels / max(raw_mask.size, 1))
@@ -349,6 +353,7 @@ def redeye_disabled_metadata(*, config: RedEyeConfig, detector: OpenCvRedEyeDete
         "redeye_strength": float(np.clip(config.strength, 0.0, 1.0)),
         "redeye_red_ratio": float(max(1.0, config.red_ratio)),
         "redeye_min_red": float(np.clip(config.min_red, 0.0, 1.0)),
+        "redeye_min_red_excess": float(np.clip(config.min_red_excess, 0.0, 1.0)),
         "redeye_min_eye_px": int(max(1, config.min_eye_px)),
         "redeye_min_mask_px": int(max(1, config.min_mask_px)),
         "redeye_max_mask_fraction": float(np.clip(config.max_mask_fraction, 0.01, 1.0)),
@@ -374,7 +379,7 @@ def redeye_skipped_metadata(*, config: RedEyeConfig, detector: OpenCvRedEyeDetec
     return data
 
 
-def red_eye_mask(*, patch_rgb: np.ndarray, red_ratio: float, min_red: float) -> np.ndarray:
+def red_eye_mask(*, patch_rgb: np.ndarray, red_ratio: float, min_red: float, min_red_excess: float) -> np.ndarray:
     r = patch_rgb[:, :, 0]
     g = patch_rgb[:, :, 1]
     b = patch_rgb[:, :, 2]
@@ -382,7 +387,7 @@ def red_eye_mask(*, patch_rgb: np.ndarray, red_ratio: float, min_red: float) -> 
 
     red_dominance = (r >= min_red) & (r > (g * red_ratio)) & (r > (b * red_ratio))
     not_skin_like = ((g + b) <= 1.2) & (luma <= 0.90) & (luma >= 0.02)
-    chroma_margin = (r - np.maximum(g, b)) >= 0.05
+    chroma_margin = (r - np.maximum(g, b)) >= min_red_excess
     center_prior = eye_center_prior(patch_rgb.shape[0], patch_rgb.shape[1])
     return red_dominance & not_skin_like & chroma_margin & center_prior
 
@@ -393,10 +398,14 @@ def correct_redeye_patch(patch_rgb: np.ndarray, *, alpha: np.ndarray, darken_fac
     b = patch_rgb[:, :, 2]
     neutral = 0.5 * (g + b)
 
-    target_r = np.minimum(neutral * darken_factor, np.maximum(g, b) * 1.05)
+    # Keep red reduction conservative and avoid pushing corrected pupils toward green/cyan.
+    target_r = np.minimum(neutral * darken_factor, np.maximum(g, b) * 1.02)
+    target_r = np.maximum(target_r, neutral * 0.68)
     target_r = np.clip(target_r, 0.0, 1.0)
-    target_g = g + (0.08 * (neutral - g))
-    target_b = b + (0.08 * (neutral - b))
+    target_gb = np.clip((0.70 * neutral) + (0.30 * target_r), 0.0, 1.0)
+    target_gb = np.minimum(target_gb, target_r + 0.03)
+    target_g = target_gb
+    target_b = target_gb
 
     r_new = r + (alpha * (target_r - r))
     g_new = g + (alpha * (target_g - g))

@@ -19,7 +19,7 @@ This implementation currently includes:
 - optional conservative face-local sharpening boost (no generative face enhancement)
 - optional conservative red-eye reduction for color photos (detector/guardrail gated)
 - Stage 6 face enhancement with conservative local blending and safety guardrails
-- 16-bit lossless PNG or TIFF output
+- final JPG output only, capped at 3 MiB per image (deterministic quality/downscale guardrail)
 - JSONL metadata logging per image
 
 ## Usage
@@ -45,7 +45,19 @@ python3 -m pip install -r requirements-face-enhance.lock.txt
 Optional output format:
 
 ```bash
-restore-batch /absolute/path/to/input /absolute/path/to/output --recursive --output-format tiff
+restore-batch /absolute/path/to/input /absolute/path/to/output --recursive --output-format jpg
+```
+
+JPG size-cap controls:
+
+```bash
+restore-batch /absolute/path/to/input /absolute/path/to/output --recursive \
+  --jpg-max-mb 3.0 \
+  --jpg-quality-max 92 \
+  --jpg-quality-min 62 \
+  --jpg-quality-step 4 \
+  --jpg-downscale-step 0.90 \
+  --jpg-min-side 320
 ```
 
 ## Production preset (one-command)
@@ -100,8 +112,10 @@ restore-batch /absolute/path/to/input /absolute/path/to/output \
   --face-sharpen-boost 1.15 \
   --redeye on \
   --redeye-strength 0.70 \
-  --redeye-red-ratio 1.45 \
+  --redeye-red-ratio 1.65 \
   --redeye-min-red 0.20 \
+  --redeye-min-red-excess 0.12 \
+  --redeye-max-mask-fraction 0.12 \
   --face-enhance-backend gfpgan \
   --face-model-path /absolute/path/to/GFPGANv1.4.pth \
   --face-enhance-strength 0.35 \
@@ -133,8 +147,8 @@ By default metadata is written to:
 
 `<output_dir>/normalization_metadata.jsonl`
 
-Each line is a JSON record including source format/mode, orientation handling, image-type classification, white-balance method/scales, tonal black/white points, tonal clipping fractions, denoise method/strength, noise and sharpness proxies before/after, sharpening parameters and edge/face stats, face enhancement backend/guardrail decisions, clipping counters, timing, and output details.
-If multiple source files share the same stem in one folder (for example `photo.jpg` and `photo.tif`), output names are disambiguated with source extension suffixes (`photo__jpg.png`, `photo__tif.png`).
+Each line is a JSON record including source format/mode, orientation handling, image-type classification, white-balance method/scales, tonal black/white points, tonal clipping fractions, denoise method/strength, noise and sharpness proxies before/after, sharpening parameters and edge/face stats, face enhancement backend/guardrail decisions, clipping counters, timing, and output details (including final JPG quality, size-cap metadata, and downscale iterations when needed).
+If multiple source files share the same stem in one folder (for example `photo.jpg` and `photo.tif`), output names are disambiguated with source extension suffixes (`photo__jpg.jpg`, `photo__tif.jpg`).
 
 ## Extending the pipeline
 

@@ -3,7 +3,19 @@
 
 --recursive
 --output-format
-png
+jpg
+--jpg-max-mb
+3.0
+--jpg-quality-max
+92
+--jpg-quality-min
+62
+--jpg-quality-step
+4
+--jpg-downscale-step
+0.90
+--jpg-min-side
+320
 
 --classification-threshold
 0.0012
@@ -82,15 +94,17 @@ on
 --redeye-strength
 0.70
 --redeye-red-ratio
-1.45
+1.65
 --redeye-min-red
 0.20
+--redeye-min-red-excess
+0.12
 --redeye-min-eye-px
 12
 --redeye-min-mask-px
 8
 --redeye-max-mask-fraction
-0.28
+0.12
 --redeye-feather-sigma
 1.20
 --redeye-darken-factor

@@ -6,15 +6,13 @@ from pathlib import Path
 import numpy as np
 
 
-def write_rgb_u16_tiff(path: Path, array: np.ndarray) -> None:
+def encode_rgb_u16_tiff_bytes(array: np.ndarray) -> bytes:
     if array.dtype != np.uint16:
         raise ValueError("Expected uint16 RGB array.")
     if array.ndim != 3 or array.shape[2] != 3:
         raise ValueError("Expected shape (height, width, 3).")
 
     height, width, _ = array.shape
-    path.parent.mkdir(parents=True, exist_ok=True)
-
     payload = np.ascontiguousarray(array.astype("<u2", copy=False)).tobytes()
     strip_byte_count = len(payload)
 
@@ -38,15 +36,23 @@ def write_rgb_u16_tiff(path: Path, array: np.ndarray) -> None:
     entries.append((279, 4, 1, strip_byte_count))  # StripByteCounts
     entries.append((284, 3, 1, 1))  # PlanarConfiguration = chunky
 
+    out = bytearray()
+    out.extend(b"II")  # Little endian
+    out.extend(struct.pack("<H", 42))
+    out.extend(struct.pack("<I", ifd_offset))
+
+    out.extend(struct.pack("<H", entry_count))
+    for tag, typ, count, value in entries:
+        out.extend(struct.pack("<HHII", tag, typ, count, value))
+    out.extend(struct.pack("<I", 0))  # next IFD offset
+
+    out.extend(bits_per_sample_data)
+    out.extend(payload)
+    return bytes(out)
+
+
+def write_rgb_u16_tiff(path: Path, array: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = encode_rgb_u16_tiff_bytes(array)
     with path.open("wb") as handle:
-        handle.write(b"II")  # Little endian
-        handle.write(struct.pack("<H", 42))
-        handle.write(struct.pack("<I", ifd_offset))
-
-        handle.write(struct.pack("<H", entry_count))
-        for tag, typ, count, value in entries:
-            handle.write(struct.pack("<HHII", tag, typ, count, value))
-        handle.write(struct.pack("<I", 0))  # next IFD offset
-
-        handle.write(bits_per_sample_data)
         handle.write(payload)

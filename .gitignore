@@ -6,9 +6,6 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
-outputs/
-TestPics/
-gfpgan/
 *.pth
 *.pt
 *.log
