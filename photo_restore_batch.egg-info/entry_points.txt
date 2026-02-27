@@ -1,0 +1,2 @@
+[console_scripts]
+restore-batch = restore_batch.cli:main

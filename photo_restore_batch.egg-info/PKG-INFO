@@ -1,0 +1,16 @@
+Metadata-Version: 2.4
+Name: photo-restore-batch
+Version: 0.1.0
+Summary: Batch photo restoration pipeline (normalization stage)
+Requires-Python: >=3.10
+Requires-Dist: numpy>=1.26.0
+Requires-Dist: Pillow>=10.0.0
+Provides-Extra: face-enhance
+Requires-Dist: gfpgan==1.3.8; extra == "face-enhance"
+Requires-Dist: basicsr==1.4.2; extra == "face-enhance"
+Requires-Dist: facexlib==0.3.0; extra == "face-enhance"
+Requires-Dist: torch==2.10.0; extra == "face-enhance"
+Requires-Dist: torchvision==0.25.0; extra == "face-enhance"
+Requires-Dist: opencv-python==4.13.0.92; extra == "face-enhance"
+Provides-Extra: openai-repair
+Requires-Dist: openai>=1.0.0; extra == "openai-repair"

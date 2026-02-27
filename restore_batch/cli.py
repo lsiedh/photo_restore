@@ -17,6 +17,12 @@ from .jpeg_out import JpegExportConfig, JpegExportError, export_jpg_with_cap
 from .metadata import JsonlMetadataWriter, SidecarMetadataWriter
 from .models import ImageContext
 from .normalize import NormalizationConfig, NormalizationStage
+from .openai_repair import (
+    DEFAULT_OPENAI_REPAIR_PROMPT_BW,
+    DEFAULT_OPENAI_REPAIR_PROMPT_COLOR,
+    OpenAIRepairConfig,
+    OpenAIRepairStage,
+)
 from .pipeline import ProcessingPipeline
 from .redeye import RedEyeConfig, RedEyeStage
 from .sharpen import SharpenConfig, SharpenStage
@@ -431,10 +437,99 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Darkening factor applied to red channel in masked regions.",
     )
     parser.add_argument(
+        "--openai-repair",
+        choices=("off", "on"),
+        default="off",
+        help="Optional OpenAI Images repair stage for stains/damage reconstruction.",
+    )
+    parser.add_argument(
+        "--openai-repair-mask",
+        choices=("auto", "none"),
+        default="none",
+        help="Masking mode for OpenAI repair edits.",
+    )
+    parser.add_argument(
+        "--openai-repair-aggressiveness",
+        choices=("conservative", "balanced", "aggressive"),
+        default="conservative",
+        help="Auto-mask aggressiveness for OpenAI repair.",
+    )
+    parser.add_argument(
+        "--openai-repair-model",
+        type=str,
+        default="gpt-image-1",
+        help="OpenAI image model used for repair edits.",
+    )
+    parser.add_argument(
+        "--openai-repair-quality",
+        choices=("low", "medium", "high", "auto"),
+        default="medium",
+        help="Quality setting for OpenAI repair edits.",
+    )
+    parser.add_argument(
+        "--openai-repair-input-fidelity",
+        choices=("low", "high"),
+        default="high",
+        help="Input fidelity hint for OpenAI repair edits.",
+    )
+    parser.add_argument(
+        "--openai-repair-size",
+        choices=("auto", "1024x1024", "1536x1024", "1024x1536"),
+        default="auto",
+        help="Requested output size for OpenAI repair edits.",
+    )
+    parser.add_argument(
+        "--openai-repair-prompt-color",
+        type=str,
+        default=DEFAULT_OPENAI_REPAIR_PROMPT_COLOR,
+        help="Prompt template for color-photo OpenAI repair.",
+    )
+    parser.add_argument(
+        "--openai-repair-prompt-bw",
+        type=str,
+        default=DEFAULT_OPENAI_REPAIR_PROMPT_BW,
+        help="Prompt template for near-grayscale OpenAI repair.",
+    )
+    parser.add_argument(
+        "--openai-repair-prompt-override",
+        type=str,
+        default=None,
+        help="Optional prompt override applied to all images in OpenAI repair stage.",
+    )
+    parser.add_argument(
+        "--openai-repair-failure",
+        choices=("fail-open", "fail-closed"),
+        default="fail-closed",
+        help="Failure policy for OpenAI repair stage.",
+    )
+    parser.add_argument(
+        "--openai-repair-min-mask-px",
+        type=int,
+        default=96,
+        help="Minimum auto-mask pixels required before running OpenAI repair.",
+    )
+    parser.add_argument(
+        "--openai-repair-min-mask-fraction",
+        type=float,
+        default=0.0005,
+        help="Minimum auto-mask fraction required before running OpenAI repair.",
+    )
+    parser.add_argument(
+        "--openai-repair-max-mask-fraction",
+        type=float,
+        default=0.20,
+        help="Maximum auto-mask fraction allowed before skipping OpenAI repair as risky.",
+    )
+    parser.add_argument(
+        "--openai-repair-save-mask-preview",
+        action="store_true",
+        help="Save generated OpenAI repair masks under output directory for inspection.",
+    )
+    parser.add_argument(
         "--face-enhance-backend",
         choices=("gfpgan", "codeformer"),
         default="gfpgan",
-        help="Face enhancement backend for Stage 6.",
+        help="Face enhancement backend.",
     )
     parser.add_argument(
         "--face-enhance-strength",
@@ -702,6 +797,14 @@ def print_debug_stats(*, input_path: Path, metadata: dict[str, Any]) -> None:
     redeye_eyes_processed = metadata.get("redeye_eyes_processed")
     redeye_eyes_skipped = metadata.get("redeye_eyes_skipped")
     redeye_pixels = metadata.get("redeye_pixels_corrected")
+    openai_repair_enabled = metadata.get("openai_repair_enabled")
+    openai_repair_applied = metadata.get("openai_repair_applied")
+    openai_repair_skip_reason = metadata.get("openai_repair_skipped_reason")
+    openai_repair_prompt_mode = metadata.get("openai_repair_prompt_mode")
+    openai_repair_mask_mode = metadata.get("openai_repair_mask_mode")
+    openai_repair_mask_fraction = metadata.get("openai_repair_mask_fraction")
+    openai_repair_retry = metadata.get("openai_repair_retry_without_input_fidelity")
+    openai_repair_latency = metadata.get("openai_repair_latency_ms")
     face_enhance_backend = metadata.get("face_enhance_backend")
     face_enhance_applied = metadata.get("face_enhance_applied")
     face_enhance_skip_reason = metadata.get("face_enhance_skipped_reason")
@@ -753,6 +856,7 @@ def print_debug_stats(*, input_path: Path, metadata: dict[str, Any]) -> None:
             f"sharpen_sharp_before_after=({sharpen_sharp_before},{sharpen_sharp_after}) | "
             f"sharpen_faces_detected={sharpen_faces} | "
             f"redeye=(method={redeye_method},applied={redeye_applied},skip={redeye_skip_reason},faces={redeye_faces},eyes={redeye_eyes_detected}/{redeye_eyes_processed}/{redeye_eyes_skipped},pixels={redeye_pixels}) | "
+            f"openai_repair=(enabled={openai_repair_enabled},applied={openai_repair_applied},skip={openai_repair_skip_reason},prompt={openai_repair_prompt_mode},mask={openai_repair_mask_mode},mask_fraction={openai_repair_mask_fraction},retry={openai_repair_retry},latency_ms={openai_repair_latency}) | "
             f"face_enhance_backend={face_enhance_backend} | "
             f"face_enhance_applied={face_enhance_applied} | "
             f"face_enhance_skip_reason={face_enhance_skip_reason} | "
@@ -866,6 +970,25 @@ def process_batch(args: argparse.Namespace) -> int:
             darken_factor=args.redeye_darken_factor,
         )
     )
+    openai_repair_stage = OpenAIRepairStage(
+        OpenAIRepairConfig(
+            mode=args.openai_repair,
+            mask_mode=args.openai_repair_mask,
+            aggressiveness=args.openai_repair_aggressiveness,
+            model=args.openai_repair_model,
+            quality=args.openai_repair_quality,
+            input_fidelity=args.openai_repair_input_fidelity,
+            size=args.openai_repair_size,
+            prompt_color=args.openai_repair_prompt_color,
+            prompt_bw=args.openai_repair_prompt_bw,
+            prompt_override=args.openai_repair_prompt_override,
+            failure_mode=args.openai_repair_failure,
+            min_mask_px=args.openai_repair_min_mask_px,
+            min_mask_fraction=args.openai_repair_min_mask_fraction,
+            max_mask_fraction=args.openai_repair_max_mask_fraction,
+            save_mask_preview=args.openai_repair_save_mask_preview,
+        )
+    )
     face_model_path = args.face_model_path.resolve() if args.face_model_path is not None else None
     face_enhance_stage = FaceEnhancementStage(
         FaceEnhancementConfig(
@@ -903,6 +1026,7 @@ def process_batch(args: argparse.Namespace) -> int:
         denoise_stage,
         sharpen_stage,
         redeye_stage,
+        openai_repair_stage,
         face_enhance_stage,
     ]
     stage_names = [stage.name for stage in stages]
@@ -933,6 +1057,14 @@ def process_batch(args: argparse.Namespace) -> int:
     redeye_eyes_detected_total = 0
     redeye_eyes_processed_total = 0
     redeye_eyes_skipped_total = 0
+    openai_repair_evaluated_count = 0
+    openai_repair_applied_image_count = 0
+    openai_repair_no_damage_skip_count = 0
+    openai_repair_mask_risk_skip_count = 0
+    openai_repair_structure_risk_skip_count = 0
+    openai_repair_api_key_missing_count = 0
+    openai_repair_package_missing_count = 0
+    openai_repair_api_error_skip_count = 0
     jpg_export_config = JpegExportConfig(
         max_mb=args.jpg_max_mb,
         quality_max=args.jpg_quality_max,
@@ -941,6 +1073,35 @@ def process_batch(args: argparse.Namespace) -> int:
         downscale_step=args.jpg_downscale_step,
         min_side=args.jpg_min_side,
     )
+
+    def update_openai_repair_counters(record: dict[str, Any]) -> None:
+        nonlocal openai_repair_evaluated_count
+        nonlocal openai_repair_applied_image_count
+        nonlocal openai_repair_no_damage_skip_count
+        nonlocal openai_repair_mask_risk_skip_count
+        nonlocal openai_repair_structure_risk_skip_count
+        nonlocal openai_repair_api_key_missing_count
+        nonlocal openai_repair_package_missing_count
+        nonlocal openai_repair_api_error_skip_count
+
+        if "openai_repair_requested" not in record:
+            return
+        openai_repair_evaluated_count += 1
+        if bool(record.get("openai_repair_applied")):
+            openai_repair_applied_image_count += 1
+        openai_repair_skip_reason = str(record.get("openai_repair_skipped_reason", ""))
+        if openai_repair_skip_reason == "no-damage-candidates":
+            openai_repair_no_damage_skip_count += 1
+        elif openai_repair_skip_reason == "mask-too-large-risk":
+            openai_repair_mask_risk_skip_count += 1
+        elif openai_repair_skip_reason == "structure-change-risk":
+            openai_repair_structure_risk_skip_count += 1
+        elif openai_repair_skip_reason == "api-key-missing":
+            openai_repair_api_key_missing_count += 1
+        elif openai_repair_skip_reason == "openai-package-missing":
+            openai_repair_package_missing_count += 1
+        elif openai_repair_skip_reason == "api-error":
+            openai_repair_api_error_skip_count += 1
 
     for input_path in images:
         started = time.perf_counter()
@@ -1009,6 +1170,7 @@ def process_batch(args: argparse.Namespace) -> int:
             redeye_eyes_skipped_total += int(record.get("redeye_eyes_skipped", 0))
             if bool(record.get("redeye_applied")):
                 redeye_applied_image_count += 1
+            update_openai_repair_counters(record)
 
             face_enhance_skip_reason = str(record.get("face_enhance_skipped_reason", ""))
             if face_enhance_skip_reason == "backend-unavailable":
@@ -1028,12 +1190,16 @@ def process_batch(args: argparse.Namespace) -> int:
                 record.update(context.metadata)
             record.update(exc.metadata)
             record.update({"status": "error", "error": str(exc), "elapsed_ms": elapsed_ms})
+            update_openai_repair_counters(record)
             metadata_writer.write(record)
             LOGGER.error("Failed JPG export for image: %s (%s)", input_path, exc)
         except Exception as exc:  # noqa: BLE001 - batch should continue after failures.
             error_count += 1
             elapsed_ms = round((time.perf_counter() - started) * 1000.0, 3)
+            if context is not None:
+                record.update(context.metadata)
             record.update({"status": "error", "error": str(exc), "elapsed_ms": elapsed_ms})
+            update_openai_repair_counters(record)
             metadata_writer.write(record)
             LOGGER.exception("Failed to process image: %s", input_path)
 
@@ -1061,6 +1227,17 @@ def process_batch(args: argparse.Namespace) -> int:
         redeye_eyes_skipped_total,
     )
     LOGGER.info(
+        "OpenAI repair summary: applied_images=%d/%d no_damage_skips=%d mask_risk_skips=%d structure_risk_skips=%d api_key_missing=%d package_missing=%d api_error_skips=%d",
+        openai_repair_applied_image_count,
+        openai_repair_evaluated_count,
+        openai_repair_no_damage_skip_count,
+        openai_repair_mask_risk_skip_count,
+        openai_repair_structure_risk_skip_count,
+        openai_repair_api_key_missing_count,
+        openai_repair_package_missing_count,
+        openai_repair_api_error_skip_count,
+    )
+    LOGGER.info(
         "Face enhancement summary: processed_images=%d/%d processed_faces=%d skipped_faces=%d no_faces_detected=%d all_faces_skipped=%d backend_unavailable=%d detector_unavailable=%d",
         face_enhance_processed_image_count,
         success_count,
@@ -1079,6 +1256,22 @@ def process_batch(args: argparse.Namespace) -> int:
     if success_count > 0 and face_enhance_detector_unavailable_count == success_count:
         LOGGER.warning(
             "Face enhancement could not run in this batch because the face detector was unavailable.",
+        )
+    if (
+        args.openai_repair == "on"
+        and openai_repair_evaluated_count > 0
+        and openai_repair_api_key_missing_count == openai_repair_evaluated_count
+    ):
+        LOGGER.warning(
+            "OpenAI repair was skipped for the full run because OPENAI_API_KEY was not available.",
+        )
+    if (
+        args.openai_repair == "on"
+        and openai_repair_evaluated_count > 0
+        and openai_repair_package_missing_count == openai_repair_evaluated_count
+    ):
+        LOGGER.warning(
+            "OpenAI repair was skipped for the full run because the openai package is not installed. Install optional dependency extra: openai-repair.",
         )
     return 1 if error_count else 0
 
