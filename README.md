@@ -18,7 +18,6 @@ This implementation currently includes:
 - edge-aware sharpening on luminance with halo/smooth-region protection
 - optional conservative face-local sharpening boost (no generative face enhancement)
 - optional conservative red-eye reduction for color photos (detector/guardrail gated)
-- optional OpenAI Images damage-repair stage (default off, full-frame by default, fail-closed by default)
 - face enhancement with conservative local blending and safety guardrails
 - final JPG output only, capped at 3 MiB per image (deterministic quality/downscale guardrail)
 - JSONL metadata logging per image
@@ -41,18 +40,6 @@ Install pinned face-enhancement dependencies (GFPGAN path):
 ```bash
 python3 -m pip install -e ".[face-enhance]"
 python3 -m pip install -r requirements-face-enhance.lock.txt
-```
-
-Install optional OpenAI-repair dependency:
-
-```bash
-python3 -m pip install -e ".[openai-repair]"
-```
-
-OpenAI repair requires an API key in your environment:
-
-```bash
-export OPENAI_API_KEY="your_key_here"
 ```
 
 Optional output format:
@@ -153,51 +140,6 @@ restore-batch /absolute/path/to/input /absolute/path/to/output \
 
 Face enhancement is part of the standard pipeline. It is applied per-face only when guardrails indicate a likely good outcome; otherwise that face is skipped and the reason is recorded in metadata.
 If `--face-model-path` is not provided for GFPGAN, the pipeline auto-resolves a local model file when available and otherwise uses the official GFPGAN model URL.
-
-## Optional OpenAI damage repair stage
-
-The OpenAI repair stage is disabled by default, so existing runs are unchanged unless you enable:
-
-```bash
-restore-batch /absolute/path/to/input /absolute/path/to/output \
-  --openai-repair on
-```
-
-When enabled, a structural guardrail checks the repaired frame against the pre-OpenAI frame and automatically falls back if geometry changes are too large.
-
-Default prompt templates:
-
-- color photos:
-  - `Please remove the stains and damage to the attached picture. Also fix any color cast, should it be calculated to exist. Also remove any visible photo paper texture. Leave everything else the same, especially the faces.`
-- black and white / near-grayscale photos:
-  - `Please remove the stains and damage to the attached picture. Make sure the picture has a full tonal range. Also remove any visible photo paper texture. Leave everything else the same, especially the faces.`
-
-Prompt-selection behavior:
-
-- `--openai-repair-prompt-override` takes priority for all images
-- otherwise `image_type == true-color` uses the color prompt
-- otherwise the black/white prompt is used
-
-Recommended explicit run:
-
-```bash
-restore-batch /absolute/path/to/input /absolute/path/to/output \
-  --openai-repair on \
-  --openai-repair-mask none \
-  --openai-repair-aggressiveness conservative \
-  --openai-repair-model gpt-image-1 \
-  --openai-repair-quality medium \
-  --openai-repair-input-fidelity high \
-  --openai-repair-failure fail-closed
-```
-
-Use a custom prompt override:
-
-```bash
-restore-batch /absolute/path/to/input /absolute/path/to/output \
-  --openai-repair on \
-  --openai-repair-prompt-override "Please remove tears and stains while preserving all facial details."
-```
 
 ## Metadata output
 

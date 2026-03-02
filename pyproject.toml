@@ -17,9 +17,6 @@ face-enhance = [
   "torchvision==0.25.0",
   "opencv-python==4.13.0.92",
 ]
-openai-repair = [
-  "openai>=1.0.0",
-]
 
 [project.scripts]
 restore-batch = "restore_batch.cli:main"
