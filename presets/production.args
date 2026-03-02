@@ -79,6 +79,7 @@ edge-aware-luma
 0.22
 --denoise-chroma-strength
 0.08
+--auto-strength
 
 --sharpen
 edge-aware-unsharp

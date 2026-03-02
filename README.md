@@ -134,9 +134,10 @@ restore-batch /absolute/path/to/input /absolute/path/to/output \
   --face-min-detail-lapvar 7.5e-05 \
   --face-detail-check-max-px 150 \
   --strict-icc \
-  --auto-strength \
   --debug-stats
 ```
+
+`--auto-strength` is enabled by default. Use `--no-auto-strength` to disable adaptive denoise strength.
 
 Face enhancement is part of the standard pipeline. It is applied per-face only when guardrails indicate a likely good outcome; otherwise that face is skipped and the reason is recorded in metadata.
 If `--face-model-path` is not provided for GFPGAN, the pipeline auto-resolves a local model file when available and otherwise uses the official GFPGAN model URL.

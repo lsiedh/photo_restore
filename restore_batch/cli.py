@@ -332,8 +332,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--auto-strength",
-        action="store_true",
-        help="Automatically adjust denoise strength from a noise proxy.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Automatically adjust denoise strength from a noise proxy (default: on).",
     )
     parser.add_argument(
         "--sharpen",
