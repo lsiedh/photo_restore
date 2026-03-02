@@ -11,6 +11,7 @@ from typing import Any
 from .classification import ClassificationConfig, ImageTypeClassificationStage
 from .denoise import DenoiseConfig, DenoiseStage
 from .discovery import discover_images
+from .dust import DustCleanupConfig, DustCleanupStage
 from .face_enhance import FaceEnhancementConfig, FaceEnhancementStage
 from .flatfield import FlatFieldConfig, FlatFieldStage
 from .jpeg_out import JpegExportConfig, JpegExportError, export_jpg_with_cap
@@ -187,6 +188,36 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Gaussian pre-smoothing sigma used by robust gray-edge fallback estimation.",
     )
     parser.add_argument(
+        "--wb-cast-removal-mode",
+        choices=("conservative", "aggressive"),
+        default="conservative",
+        help="Cast-removal aggressiveness for global white balance.",
+    )
+    parser.add_argument(
+        "--wb-skin-saturation-auto",
+        choices=("on", "off"),
+        default="on",
+        help="Auto-adjust skin saturation after white balance to keep skin tones natural.",
+    )
+    parser.add_argument(
+        "--wb-skin-sat-target-low",
+        type=float,
+        default=0.16,
+        help="Lower skin-saturation target bound for auto adjustment.",
+    )
+    parser.add_argument(
+        "--wb-skin-sat-target-high",
+        type=float,
+        default=0.48,
+        help="Upper skin-saturation target bound for auto adjustment.",
+    )
+    parser.add_argument(
+        "--wb-skin-sat-adjust-limit",
+        type=float,
+        default=0.20,
+        help="Maximum fractional skin saturation adjustment (e.g. 0.20 = +/-20%%).",
+    )
+    parser.add_argument(
         "--wb-border-band",
         type=float,
         default=0.08,
@@ -311,6 +342,83 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=0.001,
         help="Maximum tolerated pre-clip pixel fraction during tonal correction.",
+    )
+    parser.add_argument(
+        "--dust-clean",
+        choices=("off", "on"),
+        default="on",
+        help="Automatic dust/speck cleanup using conservative global detection plus inpainting.",
+    )
+    parser.add_argument(
+        "--dust-response-sigma",
+        type=float,
+        default=1.15,
+        help="Base Gaussian sigma for local dust-response estimation.",
+    )
+    parser.add_argument(
+        "--dust-response-sigma-wide",
+        type=float,
+        default=2.20,
+        help="Wide Gaussian sigma for larger dust-response support.",
+    )
+    parser.add_argument(
+        "--dust-mad-multiplier",
+        type=float,
+        default=5.0,
+        help="Robust MAD threshold multiplier for dust candidate detection.",
+    )
+    parser.add_argument(
+        "--dust-min-contrast",
+        type=float,
+        default=0.020,
+        help="Minimum luminance contrast required to classify pixels as dust candidates.",
+    )
+    parser.add_argument(
+        "--dust-texture-percentile",
+        type=float,
+        default=62.0,
+        help="Gradient percentile used to keep detection in smoother, low-texture areas.",
+    )
+    parser.add_argument(
+        "--dust-min-component-px",
+        type=int,
+        default=3,
+        help="Minimum connected-component size (pixels) for valid dust specks.",
+    )
+    parser.add_argument(
+        "--dust-max-component-px",
+        type=int,
+        default=220,
+        help="Maximum connected-component size (pixels) for valid dust specks.",
+    )
+    parser.add_argument(
+        "--dust-max-component-aspect",
+        type=float,
+        default=3.5,
+        help="Maximum component aspect ratio to reject elongated image detail.",
+    )
+    parser.add_argument(
+        "--dust-min-component-fill",
+        type=float,
+        default=0.08,
+        help="Minimum component fill ratio inside its bounding box.",
+    )
+    parser.add_argument(
+        "--dust-max-mask-fraction",
+        type=float,
+        default=0.015,
+        help="Maximum allowed dust-mask fraction before automatic safety skip.",
+    )
+    parser.add_argument(
+        "--dust-inpaint-radius",
+        type=float,
+        default=2.20,
+        help="Inpainting radius used for dust cleanup.",
+    )
+    parser.add_argument(
+        "--dust-save-mask-preview",
+        action="store_true",
+        help="Save generated dust masks under output directory for inspection.",
     )
     parser.add_argument(
         "--denoise",
@@ -657,6 +765,16 @@ def print_debug_stats(*, input_path: Path, metadata: dict[str, Any]) -> None:
     wb_consensus_agreement = metadata.get("white_balance_consensus_agreement")
     wb_estimator_weights = metadata.get("white_balance_estimator_weights")
     wb_guardrails = metadata.get("white_balance_guardrail_triggers")
+    wb_cast_mode = metadata.get("white_balance_cast_removal_mode")
+    wb_aggressive = metadata.get("white_balance_aggressive_cast_removal")
+    wb_skin_auto = metadata.get("white_balance_skin_saturation_auto_enabled")
+    wb_skin_applied = metadata.get("white_balance_skin_saturation_auto_applied")
+    wb_skin_factor = metadata.get("white_balance_skin_saturation_adjust_factor")
+    wb_skin_before = metadata.get("white_balance_skin_saturation_median_before")
+    wb_skin_after = metadata.get("white_balance_skin_saturation_median_after")
+    wb_skin_target = metadata.get("white_balance_skin_saturation_target")
+    wb_skin_pixels = metadata.get("white_balance_skin_mask_pixels")
+    wb_skin_skip = metadata.get("white_balance_skin_saturation_skipped_reason")
     chroma_bias_applied = metadata.get("chroma_bias_correction_applied")
     chroma_bias_radius = metadata.get("chroma_bias_radius_spec")
     chroma_bias_cap = metadata.get("chroma_bias_cap")
@@ -682,6 +800,16 @@ def print_debug_stats(*, input_path: Path, metadata: dict[str, Any]) -> None:
     luma_p95_after = metadata.get("tonal_luminance_p95_after")
     tonal_fallback = metadata.get("tonal_guardrail_fallback_used")
     tonal_fallback_mode = metadata.get("tonal_guardrail_fallback_mode")
+    dust_method = metadata.get("dust_clean_method")
+    dust_applied = metadata.get("dust_clean_applied")
+    dust_backend = metadata.get("dust_clean_backend")
+    dust_skip_reason = metadata.get("dust_clean_skipped_reason")
+    dust_mask_fraction = metadata.get("dust_clean_mask_fraction")
+    dust_mask_pixels = metadata.get("dust_clean_mask_pixels")
+    dust_components_kept = metadata.get("dust_clean_components_kept")
+    dust_sharp_before = metadata.get("dust_clean_sharpness_proxy_before")
+    dust_sharp_after = metadata.get("dust_clean_sharpness_proxy_after")
+    dust_luma_delta = metadata.get("dust_clean_luma_delta_mean_abs")
     denoise_method = metadata.get("denoise_method")
     denoise_strength = metadata.get("denoise_strength_chosen")
     denoise_noise_before = metadata.get("denoise_noise_proxy_before")
@@ -734,6 +862,8 @@ def print_debug_stats(*, input_path: Path, metadata: dict[str, Any]) -> None:
             f"wb_consensus_agreement={wb_consensus_agreement} | "
             f"wb_estimator_weights={wb_estimator_weights} | "
             f"wb_guardrails={wb_guardrails} | "
+            f"wb_cast=(mode={wb_cast_mode},aggressive={wb_aggressive}) | "
+            f"wb_skin_sat=(auto={wb_skin_auto},applied={wb_skin_applied},factor={wb_skin_factor},before={wb_skin_before},after={wb_skin_after},target={wb_skin_target},pixels={wb_skin_pixels},skip={wb_skin_skip}) | "
             f"chroma_bias=(applied={chroma_bias_applied},radius={chroma_bias_radius},cap={chroma_bias_cap}) | "
             f"tonal_workflow={tonal_workflow} | "
             f"tonal_mapping={tonal_mapping} | "
@@ -745,6 +875,7 @@ def print_debug_stats(*, input_path: Path, metadata: dict[str, Any]) -> None:
             f"luma_p5_before_after=({luma_p5_before},{luma_p5_after}) | "
             f"luma_p95_before_after=({luma_p95_before},{luma_p95_after}) | "
             f"tonal_fallback=({tonal_fallback},{tonal_fallback_mode}) | "
+            f"dust=(method={dust_method},applied={dust_applied},backend={dust_backend},skip={dust_skip_reason},mask_fraction={dust_mask_fraction},mask_pixels={dust_mask_pixels},components_kept={dust_components_kept},sharp_before_after={dust_sharp_before}/{dust_sharp_after},luma_delta={dust_luma_delta}) | "
             f"denoise_method={denoise_method} | "
             f"denoise_strength={denoise_strength} | "
             f"denoise_noise_before_after=({denoise_noise_before},{denoise_noise_after}) | "
@@ -807,6 +938,11 @@ def process_batch(args: argparse.Namespace) -> int:
             max_gain=args.wb_max_gain,
             shades_of_gray_p=args.wb_shades_of_gray_p,
             gray_edge_sigma=args.wb_gray_edge_sigma,
+            cast_removal_mode=args.wb_cast_removal_mode,
+            skin_saturation_auto=args.wb_skin_saturation_auto,
+            skin_sat_target_low=args.wb_skin_sat_target_low,
+            skin_sat_target_high=args.wb_skin_sat_target_high,
+            skin_sat_adjust_limit=args.wb_skin_sat_adjust_limit,
             min_valid_pixels=args.wb_min_valid_pixels,
             confidence_reduce_threshold=args.wb_confidence_reduce_threshold,
             confidence_skip_threshold=args.wb_confidence_skip_threshold,
@@ -833,6 +969,23 @@ def process_batch(args: argparse.Namespace) -> int:
             near_grayscale_min_effective_strength=args.tonal_near_gray_min_strength,
             dynamic_range_good=args.tonal_dynamic_range_good,
             clip_fraction_threshold=args.tonal_max_clip_fraction,
+        )
+    )
+    dust_stage = DustCleanupStage(
+        DustCleanupConfig(
+            mode=args.dust_clean,
+            response_sigma=args.dust_response_sigma,
+            response_sigma_wide=args.dust_response_sigma_wide,
+            mad_multiplier=args.dust_mad_multiplier,
+            min_contrast=args.dust_min_contrast,
+            texture_percentile=args.dust_texture_percentile,
+            min_component_px=args.dust_min_component_px,
+            max_component_px=args.dust_max_component_px,
+            max_component_aspect=args.dust_max_component_aspect,
+            min_component_fill=args.dust_min_component_fill,
+            max_mask_fraction=args.dust_max_mask_fraction,
+            inpaint_radius=args.dust_inpaint_radius,
+            save_mask_preview=args.dust_save_mask_preview,
         )
     )
     denoise_stage = DenoiseStage(
@@ -901,10 +1054,11 @@ def process_batch(args: argparse.Namespace) -> int:
         classification_stage,
         white_balance_stage,
         tonal_stage,
+        dust_stage,
         denoise_stage,
         sharpen_stage,
-        redeye_stage,
         face_enhance_stage,
+        redeye_stage,
     ]
     stage_names = [stage.name for stage in stages]
     pipeline = ProcessingPipeline(stages)
@@ -929,6 +1083,12 @@ def process_batch(args: argparse.Namespace) -> int:
     face_enhance_detector_unavailable_count = 0
     face_enhance_all_skipped_count = 0
     face_enhance_no_faces_count = 0
+    dust_evaluated_count = 0
+    dust_applied_image_count = 0
+    dust_no_candidates_skip_count = 0
+    dust_mask_risk_skip_count = 0
+    dust_no_components_skip_count = 0
+    dust_backend_fallback_count = 0
     redeye_applied_image_count = 0
     redeye_faces_detected_total = 0
     redeye_eyes_detected_total = 0
@@ -1004,6 +1164,19 @@ def process_batch(args: argparse.Namespace) -> int:
             face_enhance_skipped_faces_total += face_enhance_skipped_faces
             if face_enhance_processed_faces > 0:
                 face_enhance_processed_image_count += 1
+            if "dust_clean_enabled" in record:
+                dust_evaluated_count += 1
+                if bool(record.get("dust_clean_applied")):
+                    dust_applied_image_count += 1
+                if str(record.get("dust_clean_backend", "")) == "gaussian-fallback":
+                    dust_backend_fallback_count += 1
+                dust_skip_reason = str(record.get("dust_clean_skipped_reason", ""))
+                if dust_skip_reason == "no-candidates":
+                    dust_no_candidates_skip_count += 1
+                elif dust_skip_reason in {"candidate-mask-too-large-risk", "mask-too-large-risk"}:
+                    dust_mask_risk_skip_count += 1
+                elif dust_skip_reason == "no-components-kept":
+                    dust_no_components_skip_count += 1
             redeye_faces_detected_total += int(record.get("redeye_faces_detected", 0))
             redeye_eyes_detected_total += int(record.get("redeye_eyes_detected", 0))
             redeye_eyes_processed_total += int(record.get("redeye_eyes_processed", 0))
@@ -1054,6 +1227,15 @@ def process_batch(args: argparse.Namespace) -> int:
             face_sharpen_disabled_reason,
         )
     LOGGER.info(
+        "Dust cleanup summary: applied_images=%d/%d no_candidate_skips=%d mask_risk_skips=%d no_component_skips=%d backend_fallback=%d",
+        dust_applied_image_count,
+        dust_evaluated_count,
+        dust_no_candidates_skip_count,
+        dust_mask_risk_skip_count,
+        dust_no_components_skip_count,
+        dust_backend_fallback_count,
+    )
+    LOGGER.info(
         "Red-eye summary: applied_images=%d/%d faces_detected=%d eyes_detected=%d eyes_processed=%d eyes_skipped=%d",
         redeye_applied_image_count,
         success_count,
@@ -1081,6 +1263,14 @@ def process_batch(args: argparse.Namespace) -> int:
     if success_count > 0 and face_enhance_detector_unavailable_count == success_count:
         LOGGER.warning(
             "Face enhancement could not run in this batch because the face detector was unavailable.",
+        )
+    if (
+        args.dust_clean == "on"
+        and dust_evaluated_count > 0
+        and dust_backend_fallback_count == dust_evaluated_count
+    ):
+        LOGGER.warning(
+            "Dust cleanup used gaussian fallback for the full run because OpenCV was unavailable.",
         )
     return 1 if error_count else 0
 

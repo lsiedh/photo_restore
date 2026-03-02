@@ -118,6 +118,7 @@ def test_white_balance_transform_is_spatially_uniform_when_chroma_bias_off() -> 
         strength=0.8,
         max_gain=1.12,
         chroma_bias_correction="off",
+        skin_saturation_auto="off",
         border_band=0.10,
     )
     corrected, meta = apply_white_balance(image, cfg)
@@ -145,3 +146,43 @@ def test_white_balance_is_deterministic_for_identical_input_and_args() -> None:
     assert meta_a["white_balance_global_transform_values"] == meta_b["white_balance_global_transform_values"]
     assert meta_a["white_balance_border_used"] == meta_b["white_balance_border_used"]
     assert meta_a["white_balance_mode_mapping_reason"] == meta_b["white_balance_mode_mapping_reason"]
+
+
+def test_aggressive_cast_mode_increases_effective_strength_or_gain() -> None:
+    image = _base_color_image(120, 170)
+    conservative_cfg = WhiteBalanceConfig(
+        method="shades-of-gray",
+        strength=0.55,
+        cast_removal_mode="conservative",
+        chroma_bias_correction="off",
+    )
+    aggressive_cfg = WhiteBalanceConfig(
+        method="shades-of-gray",
+        strength=0.55,
+        cast_removal_mode="aggressive",
+        chroma_bias_correction="off",
+    )
+    _, meta_cons = apply_white_balance(image, conservative_cfg)
+    _, meta_aggr = apply_white_balance(image, aggressive_cfg)
+    assert meta_cons["white_balance_cast_removal_mode"] == "conservative"
+    assert meta_aggr["white_balance_cast_removal_mode"] == "aggressive"
+    assert meta_aggr["white_balance_strength_requested"] >= meta_cons["white_balance_strength_requested"]
+    assert meta_aggr["white_balance_max_gain"] >= meta_cons["white_balance_max_gain"]
+
+
+def test_skin_saturation_auto_adjust_is_deterministic() -> None:
+    image = _base_color_image(128, 192)
+    # Inject a deterministic skin-like patch so the mask has enough pixels.
+    image[36:92, 54:142, :] = np.array([0.72, 0.56, 0.46], dtype=np.float32)
+    cfg = WhiteBalanceConfig(
+        method="shades-of-gray",
+        cast_removal_mode="aggressive",
+        skin_saturation_auto="on",
+        chroma_bias_correction="off",
+    )
+    out_a, meta_a = apply_white_balance(image, cfg)
+    out_b, meta_b = apply_white_balance(image, cfg)
+    assert np.array_equal(out_a, out_b)
+    assert meta_a["white_balance_skin_saturation_auto_enabled"] is True
+    assert meta_a["white_balance_skin_mask_pixels"] == meta_b["white_balance_skin_mask_pixels"]
+    assert meta_a["white_balance_skin_saturation_adjust_factor"] == meta_b["white_balance_skin_saturation_adjust_factor"]

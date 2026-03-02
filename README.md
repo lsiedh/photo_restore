@@ -14,6 +14,7 @@ This implementation currently includes:
 - global luminance-based tonal normalization:
   - color workflow: white balance followed by luminance tonal remap for neutral whites, deep blacks, and natural midtones
   - near-grayscale workflow: robust percentile-based black/white point estimation, full-range luminance remap, and a gentle midtone curve
+- automatic conservative dust/speck cleanup (global robust detection + guarded inpainting)
 - edge-aware denoising with conservative defaults and detail guardrails
 - edge-aware sharpening on luminance with halo/smooth-region protection
 - optional conservative face-local sharpening boost (no generative face enhancement)
@@ -91,6 +92,11 @@ Classification, white balance, tonal, denoise, sharpening, and face enhancement 
 restore-batch /absolute/path/to/input /absolute/path/to/output \
   --classification-threshold 0.0012 \
   --white-balance shades-of-gray \
+  --wb-cast-removal-mode conservative \
+  --wb-skin-saturation-auto on \
+  --wb-skin-sat-target-low 0.16 \
+  --wb-skin-sat-target-high 0.48 \
+  --wb-skin-sat-adjust-limit 0.20 \
   --wb-strength 0.6 \
   --wb-white-patch-percentile 99.2 \
   --wb-gray-edge-sigma 1.0 \
@@ -101,6 +107,11 @@ restore-batch /absolute/path/to/input /absolute/path/to/output \
   --tonal-white-percentile 99.5 \
   --tonal-strength 0.65 \
   --tonal-contrast 0.25 \
+  --dust-clean on \
+  --dust-mad-multiplier 5.0 \
+  --dust-min-contrast 0.020 \
+  --dust-max-mask-fraction 0.015 \
+  --dust-inpaint-radius 2.2 \
   --denoise edge-aware-luma \
   --denoise-strength 0.22 \
   --denoise-chroma-strength 0.08 \
@@ -148,7 +159,7 @@ By default metadata is written to:
 
 `<output_dir>/normalization_metadata.jsonl`
 
-Each line is a JSON record including source format/mode, orientation handling, image-type classification, white-balance method/scales, tonal black/white points, tonal clipping fractions, denoise method/strength, noise and sharpness proxies before/after, sharpening parameters and edge/face stats, face enhancement backend/guardrail decisions, clipping counters, timing, and output details (including final JPG quality, size-cap metadata, and downscale iterations when needed).
+Each line is a JSON record including source format/mode, orientation handling, image-type classification, white-balance method/scales, tonal black/white points, tonal clipping fractions, dust mask/inpaint stats, denoise method/strength, noise and sharpness proxies before/after, sharpening parameters and edge/face stats, face enhancement backend/guardrail decisions, clipping counters, timing, and output details (including final JPG quality, size-cap metadata, and downscale iterations when needed).
 If multiple source files share the same stem in one folder (for example `photo.jpg` and `photo.tif`), output names are disambiguated with source extension suffixes (`photo__jpg.jpg`, `photo__tif.jpg`).
 
 ## Extending the pipeline

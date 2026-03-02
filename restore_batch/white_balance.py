@@ -41,6 +41,17 @@ class WhiteBalanceConfig:
     chroma_bias_cap: float = 0.020
     chroma_bias_strength: float = 0.70
     max_chroma_boost: float = 0.15
+    cast_removal_mode: str = "conservative"
+    aggressive_strength_boost: float = 1.35
+    aggressive_max_gain_boost: float = 1.15
+    aggressive_max_hue_rotation_deg: float = 24.0
+    aggressive_max_saturation_gain: float = 1.35
+    aggressive_chroma_bias_strength: float = 0.85
+    skin_saturation_auto: str = "on"
+    skin_sat_target_low: float = 0.16
+    skin_sat_target_high: float = 0.48
+    skin_sat_adjust_limit: float = 0.20
+    skin_sat_min_pixels: int = 800
 
 
 class WhiteBalanceStage:
@@ -110,6 +121,21 @@ class WhiteBalanceStage:
                     "white_balance_adaptation_space": "none",
                     "white_balance_adaptation_scales_raw": [1.0, 1.0, 1.0],
                     "white_balance_adaptation_scales_applied": [1.0, 1.0, 1.0],
+                    "white_balance_cast_removal_mode": normalize_cast_mode(self.config.cast_removal_mode),
+                    "white_balance_aggressive_cast_removal": bool(
+                        normalize_cast_mode(self.config.cast_removal_mode) == "aggressive"
+                    ),
+                    "white_balance_skin_saturation_auto_enabled": bool(
+                        str(self.config.skin_saturation_auto).lower() == "on"
+                    ),
+                    "white_balance_skin_saturation_auto_applied": False,
+                    "white_balance_skin_saturation_adjust_factor": 1.0,
+                    "white_balance_skin_saturation_median_before": None,
+                    "white_balance_skin_saturation_median_after": None,
+                    "white_balance_skin_saturation_target": None,
+                    "white_balance_skin_mask_pixels": 0,
+                    "white_balance_skin_mask_fraction": 0.0,
+                    "white_balance_skin_saturation_skipped_reason": "non-color-image",
                     "chroma_bias_correction_enabled": bool(str(self.config.chroma_bias_correction).lower() == "on"),
                     "chroma_bias_correction_applied": False,
                     "chroma_bias_correction_skipped_reason": "non-color-image",
@@ -129,11 +155,33 @@ def apply_white_balance(image_srgb: np.ndarray, config: WhiteBalanceConfig) -> t
     luminance_before = rec709_luminance(linear)
     mode_meta = normalize_white_balance_mode(config.method)
 
-    strength_requested = float(np.clip(config.strength, 0.0, 1.0))
-    max_gain = float(max(1.0, config.max_gain))
+    cast_mode = normalize_cast_mode(config.cast_removal_mode)
+    aggressive_cast = cast_mode == "aggressive"
+    strength_requested_base = float(np.clip(config.strength, 0.0, 1.0))
+    strength_requested = strength_requested_base
+    max_gain_base = float(max(1.0, config.max_gain))
+    max_gain = max_gain_base
     shades_of_gray_p = float(max(1.0, config.shades_of_gray_p))
     gray_edge_sigma = float(max(0.0, config.gray_edge_sigma))
     clip_threshold = float(np.clip(config.clip_fraction_threshold, 0.0, 0.02))
+    max_hue_rotation_deg = float(np.clip(config.max_hue_rotation_deg, 0.0, 90.0))
+    max_saturation_gain = float(max(1.0, config.max_saturation_gain))
+    chroma_bias_strength_effective = float(np.clip(config.chroma_bias_strength, 0.0, 1.0))
+
+    if aggressive_cast:
+        strength_requested = float(
+            np.clip(
+                strength_requested_base * max(1.0, float(config.aggressive_strength_boost)),
+                0.0,
+                1.0,
+            )
+        )
+        max_gain = float(max(max_gain_base, max_gain_base * max(1.0, float(config.aggressive_max_gain_boost))))
+        max_hue_rotation_deg = float(max(max_hue_rotation_deg, float(max(0.0, config.aggressive_max_hue_rotation_deg))))
+        max_saturation_gain = float(max(max_saturation_gain, float(max(1.0, config.aggressive_max_saturation_gain))))
+        chroma_bias_strength_effective = float(
+            max(chroma_bias_strength_effective, np.clip(config.aggressive_chroma_bias_strength, 0.0, 1.0))
+        )
 
     border = estimate_border_reference(linear=linear, config=config)
     reference_method = "border" if border["used"] else "fallback"
@@ -195,8 +243,6 @@ def apply_white_balance(image_srgb: np.ndarray, config: WhiteBalanceConfig) -> t
     luma_scalar = 1.0
     applied_scales = np.ones(3, dtype=np.float32)
     corrected_linear = linear.copy()
-    max_hue_rotation_deg = float(np.clip(config.max_hue_rotation_deg, 0.0, 90.0))
-    max_saturation_gain = float(max(1.0, config.max_saturation_gain))
     max_luma_scale = float(max(1.0, config.max_luminance_scale))
 
     for _ in range(max(0, int(config.max_guardrail_iterations)) + 1):
@@ -258,7 +304,7 @@ def apply_white_balance(image_srgb: np.ndarray, config: WhiteBalanceConfig) -> t
             linear_rgb=corrected_linear,
             radius_spec=str(config.chroma_bias_radius_spec),
             cap=float(np.clip(config.chroma_bias_cap, 0.0, 0.20)),
-            strength=float(np.clip(config.chroma_bias_strength, 0.0, 1.0)),
+            strength=chroma_bias_strength_effective,
         )
     else:
         chroma_bias_meta = {
@@ -282,6 +328,31 @@ def apply_white_balance(image_srgb: np.ndarray, config: WhiteBalanceConfig) -> t
     preclip_fraction = float(np.mean((corrected_linear < 0.0) | (corrected_linear > 1.0)))
     corrected_linear = np.clip(corrected_linear, 0.0, 1.0)
     corrected_srgb = linear_to_srgb(corrected_linear)
+
+    skin_sat_auto_enabled = str(config.skin_saturation_auto).lower() == "on"
+    skin_sat_meta: dict[str, Any]
+    if skin_sat_auto_enabled and strength_effective > 1e-6:
+        corrected_srgb, skin_sat_meta = auto_adjust_skin_saturation(
+            original_srgb=source,
+            corrected_srgb=corrected_srgb,
+            sat_target_low=float(np.clip(config.skin_sat_target_low, 0.02, 0.95)),
+            sat_target_high=float(np.clip(config.skin_sat_target_high, 0.05, 0.98)),
+            sat_adjust_limit=float(np.clip(config.skin_sat_adjust_limit, 0.02, 0.60)),
+            min_pixels=max(64, int(config.skin_sat_min_pixels)),
+        )
+        corrected_linear = srgb_to_linear(corrected_srgb)
+    else:
+        skin_sat_meta = {
+            "white_balance_skin_saturation_auto_enabled": skin_sat_auto_enabled,
+            "white_balance_skin_saturation_auto_applied": False,
+            "white_balance_skin_saturation_adjust_factor": 1.0,
+            "white_balance_skin_saturation_median_before": None,
+            "white_balance_skin_saturation_median_after": None,
+            "white_balance_skin_saturation_target": None,
+            "white_balance_skin_mask_pixels": 0,
+            "white_balance_skin_mask_fraction": 0.0,
+            "white_balance_skin_saturation_skipped_reason": ("disabled" if not skin_sat_auto_enabled else "wb-disabled"),
+        }
 
     luminance_after = rec709_luminance(corrected_linear)
     applied_channel_scales = [float(x) for x in (applied_scales * luma_scalar)]
@@ -325,9 +396,13 @@ def apply_white_balance(image_srgb: np.ndarray, config: WhiteBalanceConfig) -> t
         "white_balance_sampling_mode": sampling_mode,
         "white_balance_sampling_fallback_used": reference_method != "border",
         "white_balance_strength_requested": strength_requested,
+        "white_balance_strength_requested_base": strength_requested_base,
         "white_balance_strength_effective": float(strength_effective),
         "white_balance_strength": float(strength_effective),
+        "white_balance_cast_removal_mode": cast_mode,
+        "white_balance_aggressive_cast_removal": bool(aggressive_cast),
         "white_balance_max_gain": max_gain,
+        "white_balance_max_gain_base": max_gain_base,
         "white_balance_shades_of_gray_p": shades_of_gray_p,
         "white_balance_gray_edge_sigma": gray_edge_sigma,
         "white_balance_preclip_fraction": preclip_fraction,
@@ -349,6 +424,7 @@ def apply_white_balance(image_srgb: np.ndarray, config: WhiteBalanceConfig) -> t
         "white_balance_adaptation_scales_applied": applied_channel_scales,
     }
     metadata.update(chroma_bias_meta)
+    metadata.update(skin_sat_meta)
     return corrected_srgb.astype(np.float32, copy=False), metadata
 
 
@@ -388,6 +464,142 @@ def normalize_white_balance_mode(method: str) -> dict[str, Any]:
         "mode_mapped": True,
         "mapping_reason": "unsupported-mode-mapped-to-shades-of-gray",
     }
+
+
+def normalize_cast_mode(mode: str) -> str:
+    value = str(mode).strip().lower()
+    if value == "aggressive":
+        return "aggressive"
+    return "conservative"
+
+
+def auto_adjust_skin_saturation(
+    *,
+    original_srgb: np.ndarray,
+    corrected_srgb: np.ndarray,
+    sat_target_low: float,
+    sat_target_high: float,
+    sat_adjust_limit: float,
+    min_pixels: int,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    out = np.clip(corrected_srgb, 0.0, 1.0).astype(np.float32, copy=False)
+    sat_target_low = float(np.clip(sat_target_low, 0.02, 0.95))
+    sat_target_high = float(np.clip(sat_target_high, sat_target_low + 1e-4, 0.98))
+    sat_adjust_limit = float(np.clip(sat_adjust_limit, 0.02, 0.60))
+
+    skin_mask = estimate_skin_mask_srgb(out)
+    skin_pixels = int(np.count_nonzero(skin_mask))
+    skin_fraction = float(skin_pixels / max(out.shape[0] * out.shape[1], 1))
+    if skin_pixels < max(64, int(min_pixels)):
+        return out, {
+            "white_balance_skin_saturation_auto_enabled": True,
+            "white_balance_skin_saturation_auto_applied": False,
+            "white_balance_skin_saturation_adjust_factor": 1.0,
+            "white_balance_skin_saturation_median_before": None,
+            "white_balance_skin_saturation_median_after": None,
+            "white_balance_skin_saturation_target": None,
+            "white_balance_skin_mask_pixels": skin_pixels,
+            "white_balance_skin_mask_fraction": skin_fraction,
+            "white_balance_skin_saturation_skipped_reason": "insufficient-skin-pixels",
+        }
+
+    sat_before = saturation_map(original_srgb)
+    sat_after = saturation_map(out)
+    sat_before_med = float(np.median(sat_before[skin_mask]))
+    sat_after_med = float(np.median(sat_after[skin_mask]))
+    if sat_after_med <= 1e-8:
+        return out, {
+            "white_balance_skin_saturation_auto_enabled": True,
+            "white_balance_skin_saturation_auto_applied": False,
+            "white_balance_skin_saturation_adjust_factor": 1.0,
+            "white_balance_skin_saturation_median_before": sat_before_med,
+            "white_balance_skin_saturation_median_after": sat_after_med,
+            "white_balance_skin_saturation_target": None,
+            "white_balance_skin_mask_pixels": skin_pixels,
+            "white_balance_skin_mask_fraction": skin_fraction,
+            "white_balance_skin_saturation_skipped_reason": "low-saturation-measurement",
+        }
+
+    target = float(np.clip(sat_before_med, sat_target_low, sat_target_high))
+    raw_factor = target / max(sat_after_med, 1e-8)
+    min_factor = 1.0 - sat_adjust_limit
+    max_factor = 1.0 + sat_adjust_limit
+    factor = float(np.clip(raw_factor, min_factor, max_factor))
+    if abs(factor - 1.0) < 0.01:
+        return out, {
+            "white_balance_skin_saturation_auto_enabled": True,
+            "white_balance_skin_saturation_auto_applied": False,
+            "white_balance_skin_saturation_adjust_factor": 1.0,
+            "white_balance_skin_saturation_median_before": sat_before_med,
+            "white_balance_skin_saturation_median_after": sat_after_med,
+            "white_balance_skin_saturation_target": target,
+            "white_balance_skin_mask_pixels": skin_pixels,
+            "white_balance_skin_mask_fraction": skin_fraction,
+            "white_balance_skin_saturation_skipped_reason": "within-target-range",
+        }
+
+    alpha = gaussian_blur_2d(skin_mask.astype(np.float32, copy=False), sigma=2.2)
+    alpha_max = float(np.max(alpha))
+    if alpha_max > 1e-8:
+        alpha = alpha / alpha_max
+    alpha = np.clip(alpha, 0.0, 1.0)
+
+    y = (0.2990 * out[:, :, 0]) + (0.5870 * out[:, :, 1]) + (0.1140 * out[:, :, 2])
+    r = y + (factor * (out[:, :, 0] - y))
+    b = y + (factor * (out[:, :, 2] - y))
+    g = (y - (0.2990 * r) - (0.1140 * b)) / 0.5870
+    sat_adjusted = np.stack((r, g, b), axis=2).astype(np.float32, copy=False)
+    sat_adjusted = np.clip(sat_adjusted, 0.0, 1.0)
+    blended = out + (alpha[:, :, None] * (sat_adjusted - out))
+    blended = np.clip(blended, 0.0, 1.0).astype(np.float32, copy=False)
+
+    sat_final = saturation_map(blended)
+    sat_final_med = float(np.median(sat_final[skin_mask]))
+    return blended, {
+        "white_balance_skin_saturation_auto_enabled": True,
+        "white_balance_skin_saturation_auto_applied": True,
+        "white_balance_skin_saturation_adjust_factor": factor,
+        "white_balance_skin_saturation_median_before": sat_after_med,
+        "white_balance_skin_saturation_median_after": sat_final_med,
+        "white_balance_skin_saturation_target": target,
+        "white_balance_skin_mask_pixels": skin_pixels,
+        "white_balance_skin_mask_fraction": skin_fraction,
+        "white_balance_skin_saturation_skipped_reason": None,
+    }
+
+
+def estimate_skin_mask_srgb(rgb: np.ndarray) -> np.ndarray:
+    y, cb, cr = rgb_to_ycbcr_srgb(rgb)
+    return (
+        (y > 0.12)
+        & (y < 0.95)
+        & (cb >= 0.26)
+        & (cb <= 0.44)
+        & (cr >= 0.52)
+        & (cr <= 0.70)
+    )
+
+
+def rgb_to_ycbcr_srgb(rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    r = rgb[:, :, 0]
+    g = rgb[:, :, 1]
+    b = rgb[:, :, 2]
+    y = (0.2990 * r) + (0.5870 * g) + (0.1140 * b)
+    cb = ((b - y) * 0.5640) + 0.5
+    cr = ((r - y) * 0.7130) + 0.5
+    return y.astype(np.float32, copy=False), cb.astype(np.float32, copy=False), cr.astype(np.float32, copy=False)
+
+
+def saturation_map(rgb: np.ndarray) -> np.ndarray:
+    maxc = np.max(rgb, axis=2)
+    minc = np.min(rgb, axis=2)
+    sat = np.divide(
+        maxc - minc,
+        np.maximum(maxc, 1e-6),
+        out=np.zeros_like(maxc, dtype=np.float32),
+        where=maxc > 1e-6,
+    )
+    return sat.astype(np.float32, copy=False)
 
 
 def estimate_border_reference(*, linear: np.ndarray, config: WhiteBalanceConfig) -> dict[str, Any]:
