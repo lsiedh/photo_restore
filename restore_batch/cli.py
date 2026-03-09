@@ -540,6 +540,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Darkening factor applied to red channel in masked regions.",
     )
     parser.add_argument(
+        "--face-enhance",
+        choices=("off", "on"),
+        default="on",
+        help="Optional face enhancement stage (applies conservative local face restoration).",
+    )
+    parser.add_argument(
         "--face-enhance-backend",
         choices=("gfpgan", "codeformer"),
         default="gfpgan",
@@ -1023,7 +1029,7 @@ def process_batch(args: argparse.Namespace) -> int:
     face_model_path = args.face_model_path.resolve() if args.face_model_path is not None else None
     face_enhance_stage = FaceEnhancementStage(
         FaceEnhancementConfig(
-            mode="on",
+            mode=args.face_enhance,
             backend=args.face_enhance_backend,
             strength=args.face_enhance_strength,
             codeformer_fidelity=args.face_codeformer_fidelity,
